@@ -1,6 +1,6 @@
 import nltk, string
 import gensim
-from itertools import takewhile, tee, izip, chain, groupby
+from itertools import takewhile, tee, izip, chain, groupby, combinations
 from collections import Counter, defaultdict
 from functools import partial
 from operator import itemgetter
@@ -64,7 +64,7 @@ def merge_keyword_into_keyphrases(word_ranks, words):
     return sorted(keyphrases.iteritems(), key=lambda x: x[1], reverse=True)
 
 
-def convert_text_into_tfidf(texts, candidates='chunks'):
+def convert_text_into_docs(texts, candidates='chunks'):
     word_in_sentences = map(convert_text_into_sentences, texts)
 
     tagged_sents = map(pos_tag_sentences, word_in_sentences)
@@ -72,6 +72,10 @@ def convert_text_into_tfidf(texts, candidates='chunks'):
         boc_texts = map(convert_pos_tagged_sentences_into_chunks, tagged_sents)
     elif candidates == 'words':
         boc_texts = map(convert_pos_tagged_sentences_into_words, tagged_sents)
+    return boc_texts
+
+def convert_text_into_tfidf(texts, candidates='chunks'):
+    boc_texts = convert_text_into_docs(texts, candidates)
 
     # make gensim dictionary and corpus
     dictionary = gensim.corpora.Dictionary(boc_texts)
@@ -84,11 +88,11 @@ def convert_text_into_tfidf(texts, candidates='chunks'):
 
 def score_keyphrases_by_tfidf(texts, candidates='chunks', top_k=10):
     boc_texts, corpus_tfidf, dictionary = convert_text_into_tfidf(texts, candidates)
-    keypharses = []
+    res = []
     for n, doc in enumerate(corpus_tfidf):
         word_ranks = dict(map(lambda (x, y): (dictionary[x], y), doc[:top_k]))
-        keypharses.append(merge_keyword_into_keyphrases(word_ranks, boc_texts[n]))
-    return keypharses
+        res.append(merge_keyword_into_keyphrases(word_ranks, boc_texts[n]))
+    return res
 
 
 def pairwise(iterable, window_size=2):
@@ -99,30 +103,28 @@ def pairwise(iterable, window_size=2):
 
     return izip(*iters)
 
-
-def _score_keyphrases_by_textrank(text, n_keywords=10):
-    # tokenize for all words, and extract *candidate* words
-    words = [word.lower()
-             for sent in sent_tokenize(text)
-             for word in word_tokenize(sent)]
-    sent = convert_text_into_sentences(text)
-    tagged_sent = pos_tag_sentences(sent)
-    candidates = convert_pos_tagged_sentences_into_words(tagged_sent)
-    # build graph, each node is a unique candidate
+def graph_rank(candidates, n_keywords=10, personalization=None):
     graph = networkx.Graph()
     graph.add_nodes_from(set(candidates))
     # iterate over word-pairs, add unweighted edges into graph
-    for w1, w2 in pairwise(candidates):
-        if w2:
-            graph.add_edge(*sorted([w1, w2]))
+    for _ in pairwise(candidates):
+        for w1, w2 in combinations(_, 2):
+            if w2:
+                graph.add_edge(*sorted([w1, w2]))
     # score nodes using default pagerank algorithm, sort by score, keep top n_keywords
-    ranks = networkx.pagerank(graph)
+    ranks = networkx.pagerank(graph, personalization=personalization)
     if 0 < n_keywords < 1:
         n_keywords = int(round(len(candidates) * n_keywords))
     word_ranks = {word_rank[0]: word_rank[1]
                   for word_rank in sorted(ranks.iteritems(), key=lambda x: x[1], reverse=True)[:n_keywords]}
+    return word_ranks
 
-    return merge_keyword_into_keyphrases(word_ranks, words)
+def _score_keyphrases_by_textrank(text, n_keywords=10):
+    # tokenize for all words, and extract *candidate* words
+    candidates = convert_text_into_docs([text], 'words')[0]
+    # build graph, each node is a unique candidate
+    word_ranks = graph_rank(candidates)
+    return merge_keyword_into_keyphrases(word_ranks, candidates)
 
 def score_keyphrases_by_textrank(texts, n_keywords=10):
     return map(partial(_score_keyphrases_by_textrank, n_keywords=n_keywords), texts)
@@ -162,12 +164,16 @@ def score_keyphrases_by_topical_page_rank(texts, candidates='chunks', num_topics
     doc_texts, corpus_tfidf, dictionary = convert_text_into_tfidf(texts, candidates)
     lda = gensim.models.LdaModel(corpus_tfidf, id2word=dictionary, num_topics=num_topics)
     corpus_lda = lda[corpus_tfidf]
+    res = []
     for x, doc in enumerate(doc_texts):
-        for y, t_id in enumerate(xrange(lda.num_topics)):
-            personlaiztion = dict((dictionary[i], j) for (i, j) in lda.get_topic_terms(t_id, lda.num_terms) if dictionary[i] in doc)
-
-        
-    return corpus_lda, lda
+        rank = Counter()
+        topics = corpus_lda[x]
+        for t_id, weight in topics:
+            personalization = dict((dictionary[i], j) for (i, j) in lda.get_topic_terms(t_id, lda.num_terms) if dictionary[i] in doc)
+            word_rank = graph_rank(doc, personalization=personalization)
+            rank.update(dict((i, j*weight) for i, j in word_rank.items()))
+        res.append(merge_keyword_into_keyphrases(rank, doc))
+    return res
 
 
 def main():
@@ -175,28 +181,24 @@ def main():
 
     text_two = """FEATURES:\n\nCreate product catalogs in minutes using products in custom collections/smart collections/Vendors/Product types.\nCreate a front cover page and a back cover page for the catalog using text,custom fonts and images (upload your own)\nAdd social media links , company info on the back cover\nChoose one of three available layouts (Portrait/Landscape/Tabular)\nChoose a color schema/template from many freely available\nIf you want you can build your own template using tons of customization options ; save it and re-use them for next catalogs\nPreview your custom template before using with real products, this gives you a real quick way to create custom templates and modify them.\nSave up-to 12 catalogs\nOnce click PDF creation using the saved catalogs\n\n\nNot Sure?? Try it before you buy it! All plans come with 1-2 days trial!"""
 
-    keypharses = score_keyphrases_by_tfidf([text_one, text_two], 'words')
+    keypharses = score_keyphrases_by_tfidf([text_one], 'words')
 
     for doc_keyphases in keypharses:
         print doc_keyphases
 
-    keypharses = score_keyphrases_by_tfidf([text_one, text_two])
+    keypharses = score_keyphrases_by_tfidf([text_one])
 
     for doc_keyphases in keypharses:
         print doc_keyphases
 
-    for doc_keyphases in score_keyphrases_by_textrank([text_one, text_two]):
+    for doc_keyphases in score_keyphrases_by_textrank([text_one]):
         print doc_keyphases
 
-    for doc_keyphases in score_keypharses_by_rake([text_one, text_two]):
+    for doc_keyphases in score_keypharses_by_rake([text_one]):
         print doc_keyphases
 
-    corpus_lda, lda = score_keyphrases_by_topical_page_rank([text_one, text_two], num_topics=5)
-
-    for n, doc in enumerate(corpus_lda):
-        print n, '----'
-        for topic, weight in doc[:10]:
-            print weight, lda.print_topic(topic)
+    for doc_keyphases in score_keyphrases_by_topical_page_rank([text_one]):
+        print doc_keyphases
 
 
 if __name__ == "__main__":
